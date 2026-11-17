@@ -1,0 +1,1448 @@
+package drivers
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	linstorapi "github.com/LINBIT/golinstor"
+	linstorClient "github.com/LINBIT/golinstor/client"
+	"github.com/LINBIT/golinstor/clonestatus"
+	"github.com/google/uuid"
+
+	"github.com/lxc/incus/v7/internal/migration"
+	localMigration "github.com/lxc/incus/v7/internal/server/migration"
+	"github.com/lxc/incus/v7/internal/version"
+	"github.com/lxc/incus/v7/shared/api"
+	"github.com/lxc/incus/v7/shared/logger"
+	"github.com/lxc/incus/v7/shared/revert"
+	"github.com/lxc/incus/v7/shared/subprocess"
+	"github.com/lxc/incus/v7/shared/units"
+	"github.com/lxc/incus/v7/shared/util"
+)
+
+// LinstorSatellitePaths lists the possible FS paths for the Satellite script.
+var LinstorSatellitePaths = []string{"/usr/share/linstor-server/bin"}
+
+// LinstorDefaultResourceGroupPlaceCount represents the default Linstor resource group place count.
+const LinstorDefaultResourceGroupPlaceCount = "2"
+
+// LinstorDefaultResyncDiscardGranularity represents the default Linstor resync granularity.
+const LinstorDefaultResyncDiscardGranularity = "1048576"
+
+// LinstorDefaultVolumePrefix represents the default Linstor volume prefix.
+const LinstorDefaultVolumePrefix = "incus-volume-"
+
+// LinstorResourceGroupNameConfigKey represents the config key that describes the resource group name.
+const LinstorResourceGroupNameConfigKey = "linstor.resource_group.name"
+
+// LinstorResourceGroupPlaceCountConfigKey represents the config key that describes the resource group place count.
+const LinstorResourceGroupPlaceCountConfigKey = "linstor.resource_group.place_count"
+
+// LinstorRawConfigKeyPrefix represents the config key namespace that describes additional LINSTOR properties.
+const LinstorRawConfigKeyPrefix = "linstor.raw"
+
+// LinstorResourceGroupStoragePoolConfigKey represents the config key that describes the resource group storage pool.
+const LinstorResourceGroupStoragePoolConfigKey = "linstor.resource_group.storage_pool"
+
+// LinstorVolumePrefixConfigKey represents the config key that describes the prefix to add to every volume within a storage pool.
+const LinstorVolumePrefixConfigKey = "linstor.volume.prefix"
+
+// DrbdOnNoQuorumConfigKey represents the config key that describes the DRBD policy when quorum is not reached.
+const DrbdOnNoQuorumConfigKey = "drbd.on_no_quorum"
+
+// DrbdAutoDiskfulConfigKey represents the config key that describes the DRBD timeout for toggling a diskful resource.
+const DrbdAutoDiskfulConfigKey = "drbd.auto_diskful"
+
+// DrbdAutoAddQuorumTiebreakerConfigKey represents the config key that describes whether DRBD will automatically create tiebreaker resources.
+const DrbdAutoAddQuorumTiebreakerConfigKey = "drbd.auto_add_quorum_tiebreaker"
+
+// LinstorRemoveSnapshotsConfigKey represents the config key that describes whether snapshots should be automatically removed with volumes.
+const LinstorRemoveSnapshotsConfigKey = "linstor.remove_snapshots"
+
+// LinstorAuxSnapshotPrefix represents the AuxProp prefix to map Incus and LINSTOR snapshots.
+const LinstorAuxSnapshotPrefix = "Aux/Incus/snapshot-name/"
+
+// LinstorAuxName represents the AuxProp storing the Incus volume name.
+const LinstorAuxName = "Aux/Incus/name"
+
+// LinstorAuxType represents the AuxProp storing the Incus volume type.
+const LinstorAuxType = "Aux/Incus/type"
+
+// LinstorAuxContentType represents the AuxProp storing the Incus volume content type.
+const LinstorAuxContentType = "Aux/Incus/content-type"
+
+// LinstorAuxUnpacking represents the AuxProp marking an image volume whose content is still being unpacked.
+const LinstorAuxUnpacking = "Aux/Incus/unpacking"
+
+// errResourceDefinitionNotFound indicates that a resource definition could not be found in Linstor.
+var errResourceDefinitionNotFound = errors.New("Resource definition not found")
+
+// errSnapshotNotFound indicates that a snapshot could not be found in Linstor.
+var errSnapshotNotFound = errors.New("Resource definition not found")
+
+// errNotDRBDKey indicates that a configuration key is not a DRBD property.
+var errNotDRBDKey = errors.New("not found")
+
+// drbdPropsMap maps incus config keys to DRBD options.
+func drbdPropsMap(key string) (string, error) {
+	rawKey, found := strings.CutPrefix(key, LinstorRawConfigKeyPrefix+".")
+	if found {
+		if strings.HasPrefix(rawKey, "Aux/Incus/") {
+			return "", errors.New("Incus metadata cannot be manually set")
+		}
+
+		incusKey, found := map[string]string{
+			"DrbdOptions/Resource/on-no-quorum":      DrbdOnNoQuorumConfigKey,
+			"DrbdOptions/auto-diskful":               DrbdAutoDiskfulConfigKey,
+			"DrbdOptions/auto-add-quorum-tiebreaker": DrbdAutoAddQuorumTiebreakerConfigKey,
+		}[rawKey]
+		if found {
+			return "", fmt.Errorf("DRBD property %q must be set with the %q configuration key", rawKey, incusKey)
+		}
+
+		if slices.Contains([]string{
+			"DrbdOptions/Net/allow-two-primaries",
+			"DrbdOptions/Resource/quorum",
+			"DrbdOptions/auto-verify-alg",
+		}, rawKey) {
+			return "", fmt.Errorf("DRBD property %q cannot be manually set", rawKey)
+		}
+
+		return rawKey, nil
+	}
+
+	rawKey, found = map[string]string{
+		DrbdOnNoQuorumConfigKey:              "DrbdOptions/Resource/on-no-quorum",
+		DrbdAutoDiskfulConfigKey:             "DrbdOptions/auto-diskful",
+		DrbdAutoAddQuorumTiebreakerConfigKey: "DrbdOptions/auto-add-quorum-tiebreaker",
+	}[key]
+	if found {
+		return rawKey, nil
+	}
+
+	return "", errNotDRBDKey
+}
+
+// drbdVersion returns the DRBD version of the currently loaded kernel module.
+func (d *linstor) drbdVersion() (string, error) {
+	modulePath := "/sys/module/drbd/version"
+
+	if !util.PathExists(modulePath) {
+		return "", errors.New("Could not determine DRBD module version: Module not loaded")
+	}
+
+	ver, err := os.ReadFile(modulePath)
+	if err != nil {
+		return "", fmt.Errorf("Could not determine DRBD module version: %w", err)
+	}
+
+	return strings.TrimSpace(string(ver)), nil
+}
+
+// controllerVersion returns the LINSTOR controller version.
+func (d *linstor) controllerVersion() (string, error) {
+	var satellitePath string
+	for _, path := range LinstorSatellitePaths {
+		candidate := filepath.Join(path, "Satellite")
+		_, err := os.Stat(candidate)
+		if err == nil {
+			satellitePath = candidate
+			break
+		}
+	}
+
+	if satellitePath == "" {
+		return "", errors.New("LINSTOR satellite executable not found")
+	}
+
+	out, err := subprocess.RunCommand(satellitePath, "--version")
+	if err != nil {
+		return "", err
+	}
+
+	for line := range strings.SplitSeq(out, "\n") {
+		if strings.HasPrefix(line, "Version:") {
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				return "", errors.New("Could not parse LINSTOR satellite version")
+			}
+
+			return fields[1], nil
+		}
+	}
+
+	return "", errors.New("Could not parse LINSTOR satellite version")
+}
+
+// resourceGroupExists returns whether the resource group associated with the current storage pool exists.
+func (d *linstor) resourceGroupExists() (bool, error) {
+	resourceGroup, err := d.getResourceGroup()
+	if err != nil {
+		return false, fmt.Errorf("Could not get resource group: %w", err)
+	}
+
+	if resourceGroup == nil {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+// getResourceGroup fetches the resource group for the storage pool.
+func (d *linstor) getResourceGroup() (*linstorClient.ResourceGroup, error) {
+	d.logger.Debug("Fetching Linstor resource group")
+
+	// Retrieve the Linstor client.
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return nil, err
+	}
+
+	resourceGroupName := d.config[LinstorResourceGroupNameConfigKey]
+	resourceGroup, err := linstor.Client.ResourceGroups.Get(context.TODO(), resourceGroupName)
+	if errors.Is(err, linstorClient.NotFoundError) {
+		return nil, nil
+	} else if err != nil {
+		return nil, fmt.Errorf("Could not get Linstor resource group: %w", err)
+	}
+
+	return &resourceGroup, nil
+}
+
+// getResourceGroupSize fetches the resource group size info.
+func (d *linstor) getResourceGroupSize() (int64, int64, error) {
+	// Retrieve the Linstor client.
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	resourceGroupName := d.config[LinstorResourceGroupNameConfigKey]
+	resourceGroup, err := linstor.Client.ResourceGroups.Get(context.TODO(), resourceGroupName)
+	if err != nil {
+		return 0, 0, fmt.Errorf("Could not get Linstor resource group: %w", err)
+	}
+
+	storagePools, err := linstor.Client.Nodes.GetStoragePoolView(context.TODO(), &linstorClient.ListOpts{
+		StoragePool: resourceGroup.SelectFilter.StoragePoolList,
+	})
+	if err != nil {
+		return 0, 0, fmt.Errorf("Could not get Linstor storage pools: %w", err)
+	}
+
+	freeCapacity := int64(0)
+	totalCapacity := int64(0)
+	for _, storagePool := range storagePools {
+		freeCapacity += storagePool.FreeCapacity
+		totalCapacity += storagePool.TotalCapacity
+	}
+
+	return freeCapacity, totalCapacity, nil
+}
+
+// createResourceGroup creates a new resource group for the storage pool.
+func (d *linstor) createResourceGroup() error {
+	d.logger.Debug("Creating Linstor resource group")
+
+	// Retrieve the Linstor client.
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return err
+	}
+
+	placeCount, err := strconv.Atoi(d.config[LinstorResourceGroupPlaceCountConfigKey])
+	if err != nil {
+		return fmt.Errorf("Could not parse resource group place count property: %w", err)
+	}
+
+	resourceGroup := linstorClient.ResourceGroup{
+		Name:        d.config[LinstorResourceGroupNameConfigKey],
+		Description: "Resource group managed by Incus",
+		SelectFilter: linstorClient.AutoSelectFilter{
+			PlaceCount: int32(placeCount),
+		},
+	}
+
+	if d.config[LinstorResourceGroupStoragePoolConfigKey] != "" {
+		resourceGroup.SelectFilter.StoragePool = d.config[LinstorResourceGroupStoragePoolConfigKey]
+	}
+
+	// Create the resource group.
+	err = linstor.Client.ResourceGroups.Create(context.TODO(), resourceGroup)
+	if err != nil {
+		return fmt.Errorf("Could not create Linstor resource group : %w", err)
+	}
+
+	return d.setResourceGroupProperties()
+}
+
+// setResourceGroupProperties applies the DRBD properties from the pool config to the resource group.
+func (d *linstor) setResourceGroupProperties() error {
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return err
+	}
+
+	props, err := d.drbdPropsFromConfig(d.config)
+	if err != nil {
+		return fmt.Errorf("Could not parse configuration into DRBD properties: %w", err)
+	}
+
+	// Some tuning to speed up resync.
+	if props["DrbdOptions/Disk/rs-discard-granularity"] == "" {
+		props["DrbdOptions/Disk/rs-discard-granularity"] = LinstorDefaultResyncDiscardGranularity
+	}
+
+	err = linstor.Client.ResourceGroups.Modify(context.TODO(), d.config[LinstorResourceGroupNameConfigKey], linstorClient.ResourceGroupModify{
+		OverrideProps: props,
+	})
+	if err != nil {
+		return fmt.Errorf("Could not set properties on Linstor resource group : %w", err)
+	}
+
+	return nil
+}
+
+// updateResourceGroup updates the resource group for the storage pool.
+func (d *linstor) updateResourceGroup(changedConfig map[string]string) error {
+	d.logger.Debug("Updating Linstor resource group")
+
+	// Retrieve the Linstor client.
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return err
+	}
+
+	resourceGroupModify := linstorClient.ResourceGroupModify{}
+
+	placeCount, changed := changedConfig[LinstorResourceGroupPlaceCountConfigKey]
+	if changed {
+		placeCount, err := strconv.Atoi(placeCount)
+		if err != nil {
+			return fmt.Errorf("Could not parse resource group place count property: %w", err)
+		}
+
+		resourceGroupModify.SelectFilter.PlaceCount = int32(placeCount)
+	}
+
+	storagePool, changed := changedConfig[LinstorResourceGroupStoragePoolConfigKey]
+	if changed {
+		resourceGroupModify.SelectFilter.StoragePool = storagePool
+	}
+
+	// Parse and set properties to be overwritten.
+	changedProps, err := d.drbdPropsFromConfig(changedConfig)
+	if err != nil {
+		return fmt.Errorf("Could not parse configuration into DRBD properties: %w", err)
+	}
+
+	resourceGroupModify.OverrideProps = make(map[string]string)
+
+	// Discriminate properties changed and properties deleted.
+	for key, value := range changedProps {
+		if value == "" {
+			if key == "DrbdOptions/Disk/rs-discard-granularity" {
+				resourceGroupModify.OverrideProps[key] = LinstorDefaultResyncDiscardGranularity
+			} else {
+				resourceGroupModify.DeleteProps = append(resourceGroupModify.DeleteProps, key)
+			}
+		} else {
+			resourceGroupModify.OverrideProps[key] = value
+		}
+	}
+
+	resourceGroupName := d.config[LinstorResourceGroupNameConfigKey]
+
+	err = linstor.Client.ResourceGroups.Modify(context.TODO(), resourceGroupName, resourceGroupModify)
+	if err != nil {
+		return fmt.Errorf("Could not update Linstor resource group : %w", err)
+	}
+
+	return nil
+}
+
+// deleteResourceGroup deleter the resource group for the storage pool.
+func (d *linstor) deleteResourceGroup() error {
+	// Retrieve the Linstor client.
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return err
+	}
+
+	err = linstor.Client.ResourceGroups.Delete(context.TODO(), d.config[LinstorResourceGroupNameConfigKey])
+	if err != nil {
+		return fmt.Errorf("Could not delete Linstor resource group : %w", err)
+	}
+
+	return nil
+}
+
+// queryContext returns a context bounding a LINSTOR query so lookups fail rather than hang on a stalled controller.
+func (d *linstor) queryContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), time.Minute)
+}
+
+// getVolumeResourceDefinitions returns all Linstor resource definitions matching a given volume.
+func (d *linstor) getVolumeResourceDefinitions(vol Volume, fetchVolumeDefinitions bool) ([]linstorClient.ResourceDefinitionWithVolumeDefinition, error) {
+	l := logger.AddContext(logger.Ctx{"vol": vol.name, "volType": vol.volType, "contentType": vol.contentType})
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := d.queryContext()
+	defer cancel()
+
+	// Query resource definitions that match the desired volume by its name.
+	resourceDefinitions, err := linstor.Client.ResourceDefinitions.GetAll(ctx, linstorClient.RDGetAllRequest{
+		Props: []string{
+			LinstorAuxName + "=" + d.config[LinstorVolumePrefixConfigKey] + vol.name,
+			LinstorAuxType + "=" + string(vol.volType),
+		},
+		WithVolumeDefinitions: fetchVolumeDefinitions,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	l.Debug("Queried resource definitions", logger.Ctx{"query": LinstorAuxName + "=" + d.config[LinstorVolumePrefixConfigKey] + vol.name, "result": resourceDefinitions})
+
+	// Filter resource definitions for the storage pool's resource group.
+	var filteredResourceDefinitions []linstorClient.ResourceDefinitionWithVolumeDefinition
+	for _, rd := range resourceDefinitions {
+		if rd.ResourceGroupName == d.config[LinstorResourceGroupNameConfigKey] {
+			filteredResourceDefinitions = append(filteredResourceDefinitions, rd)
+		}
+	}
+
+	return filteredResourceDefinitions, nil
+}
+
+// getResourceDefinition returns the Linstor resource definition for a given volume.
+func (d *linstor) getResourceDefinition(vol Volume, fetchVolumeDefinitions bool) (linstorClient.ResourceDefinitionWithVolumeDefinition, error) {
+	l := logger.AddContext(logger.Ctx{"vol": vol.name, "volType": vol.volType, "contentType": vol.contentType})
+	l.Debug("Getting resource definition for volume")
+
+	filteredResourceDefinitions, err := d.getVolumeResourceDefinitions(vol, fetchVolumeDefinitions)
+	if err != nil {
+		return linstorClient.ResourceDefinitionWithVolumeDefinition{}, err
+	}
+
+	if len(filteredResourceDefinitions) == 0 {
+		return linstorClient.ResourceDefinitionWithVolumeDefinition{}, errResourceDefinitionNotFound
+	} else if len(filteredResourceDefinitions) > 1 {
+		return linstorClient.ResourceDefinitionWithVolumeDefinition{}, fmt.Errorf("Multiple resource definitions found for volume %s", vol.name)
+	}
+
+	return filteredResourceDefinitions[0], nil
+}
+
+// checkVolumeAbsent fails when a resource definition already exists for the volume.
+func (d *linstor) checkVolumeAbsent(vol Volume) error {
+	exists, err := d.HasVolume(vol)
+	if err != nil {
+		return err
+	}
+
+	if exists {
+		return fmt.Errorf("A resource definition already exists for volume %q", vol.name)
+	}
+
+	return nil
+}
+
+// getLinstorDevPath return the device path for a given `vol` in the current node.
+//
+// If the resource is not available on the current node, it is made available before
+// fetching its device path.
+func (d *linstor) getLinstorDevPath(vol Volume) (string, error) {
+	l := logger.AddContext(logger.Ctx{"vol": vol.name, "volType": vol.volType, "contentType": vol.contentType})
+	l.Debug("Getting device path")
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return "", err
+	}
+
+	resourceDefinition, err := d.getResourceDefinition(vol, false)
+	if err != nil {
+		return "", err
+	}
+
+	// When retrieving the device path, always make sure that the resource is available on the current node.
+	err = d.makeResourceAvailable(resourceDefinition.Name)
+	if err != nil {
+		return "", err
+	}
+
+	volumes, err := linstor.Client.Resources.GetVolumes(context.TODO(), resourceDefinition.Name, d.getSatelliteName())
+	if err != nil {
+		return "", fmt.Errorf("Unable to get Linstor volumes: %w", err)
+	}
+
+	return volumes[d.getVolumeIndex(vol, len(volumes))].DevicePath, nil
+}
+
+// deleteDisklessResource deletes the diskless resource for the given volume in the current node if one exists.
+func (d *linstor) deleteDisklessResource(vol Volume) error {
+	l := d.logger.AddContext(logger.Ctx{"volume": vol.Name()})
+	l.Debug("Checking for diskless resources to delete")
+
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return err
+	}
+
+	resourceDefinition, err := d.getResourceDefinition(vol, false)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := d.queryContext()
+	defer cancel()
+
+	// Fetch all resources for the given volume in the current node.
+	resources, err := linstor.Client.Resources.GetResourceView(ctx, &linstorClient.ListOpts{
+		Resource: []string{resourceDefinition.Name},
+		Node:     []string{d.getSatelliteName()},
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to get the resources for the resource definition: %w", err)
+	}
+
+	l.Debug("Got resources for the volume in the current node", logger.Ctx{"resources": resources})
+
+	// Delete the DISKLESS resources.
+	for _, r := range resources {
+		if slices.Contains(r.Flags, "DISKLESS") {
+			l.Debug("Deleting diskless resource")
+			err := linstor.Client.Resources.Delete(ctx, r.Name, r.NodeName)
+			if err != nil {
+				return err
+			}
+
+			l.Debug("Deleted diskless resource")
+		}
+	}
+
+	return nil
+}
+
+// getVolumeUsage returns the allocated size for a given volume in KiB.
+func (d *linstor) getVolumeUsage(vol Volume) (int64, error) {
+	l := d.logger.AddContext(logger.Ctx{"volume": vol.Name()})
+	l.Debug("Getting volume usage")
+
+	// Ambiguous resource definitions need a direct lookup.
+	resourceDefinitionName, ok := d.getCachedResourceDefinitionName(vol)
+	if !ok {
+		resourceDefinition, err := d.getResourceDefinition(vol, false)
+		if err != nil {
+			return 0, err
+		}
+
+		resourceDefinitionName = resourceDefinition.Name
+	}
+
+	// Only go through the cache, a miss means the controller couldn't be queried or there is no diskful resource.
+	usage, ok := d.getCachedVolumeUsage(resourceDefinitionName, vol)
+	if !ok {
+		return 0, errors.New("Volume usage unavailable")
+	}
+
+	return usage, nil
+}
+
+// getVolumeIndex returns the index of the volume within its LINSTOR resource.
+func (d *linstor) getVolumeIndex(vol Volume, volumeCount int) int {
+	// For VM volumes, the associated filesystem volume is a second volume on the same LINSTOR resource.
+	if volumeCount == 2 && (vol.volType == VolumeTypeVM || vol.volType == VolumeTypeImage) && vol.contentType == ContentTypeFS {
+		return 1
+	}
+
+	return 0
+}
+
+// getSatelliteName returns the local LINSTOR satellite name.
+//
+// The logic used to determine the satellite name is documented in the public
+// driver documentation, as it is relevant for users. Therefore, any changes
+// to the external behavior of this function should also be reflected in the
+// public documentation.
+func (d *linstor) getSatelliteName() string {
+	name := d.state.LocalConfig.LinstorSatelliteName()
+	if name != "" {
+		return name
+	}
+
+	if d.state.ServerClustered {
+		return d.state.ServerName
+	}
+
+	return d.state.OS.Hostname
+}
+
+// makeVolumeAvailable makes a volume available on the current node.
+func (d *linstor) makeVolumeAvailable(vol Volume) error {
+	l := d.logger.AddContext(logger.Ctx{"volume": vol.Name()})
+	l.Debug("Making volume available on node")
+
+	resourceDefinition, err := d.getResourceDefinition(vol, false)
+	if err != nil {
+		return err
+	}
+
+	return d.makeResourceAvailable(resourceDefinition.Name)
+}
+
+// makeResourceAvailable deploys the resource on the current node if it isn't already.
+// The auto-placer skips nodes with AutoplaceTarget=false, in which case a diskless replica is attached directly.
+func (d *linstor) makeResourceAvailable(resourceDefinitionName string) error {
+	l := d.logger.AddContext(logger.Ctx{"resourceDefinitionName": resourceDefinitionName, "nodeName": d.getSatelliteName()})
+
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return err
+	}
+
+	nodeName := d.getSatelliteName()
+
+	err = linstor.Client.Resources.MakeAvailable(context.TODO(), resourceDefinitionName, nodeName, linstorClient.ResourceMakeAvailable{
+		Diskful: false,
+	})
+	if err == nil {
+		return nil
+	}
+
+	if !errors.Is(err, linstorClient.NotFoundError) {
+		l.Debug("Could not make resource available on node", logger.Ctx{"error": err})
+		return fmt.Errorf("Could not make resource %q available on node %q: %w", resourceDefinitionName, nodeName, err)
+	}
+
+	// Nothing to do if the resource is already deployed on the node.
+	_, err = linstor.Client.Resources.Get(context.TODO(), resourceDefinitionName, nodeName)
+	if err == nil {
+		return nil
+	}
+
+	l.Debug("Resource can't be auto-placed on node, attaching a diskless replica")
+
+	err = linstor.Client.Resources.Create(context.TODO(), linstorClient.ResourceCreate{
+		Resource: linstorClient.Resource{
+			Name:     resourceDefinitionName,
+			NodeName: nodeName,
+			Flags:    []string{linstorapi.FlagDrbdDiskless},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("Could not attach diskless resource %q on node %q: %w", resourceDefinitionName, nodeName, err)
+	}
+
+	return nil
+}
+
+// createVolumeSnapshot creates a volume snapshot.
+func (d *linstor) createVolumeSnapshot(parentVol Volume, snapVol Volume) error {
+	l := d.logger.AddContext(logger.Ctx{"parentVol": parentVol.Name(), "snapVol": snapVol.Name()})
+	l.Debug("Creating volume snapshot")
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return err
+	}
+
+	resourceDefinition, err := d.getResourceDefinition(parentVol, false)
+	if err != nil {
+		return err
+	}
+
+	linstorSnapshotName := d.generateUUIDWithPrefix()
+
+	err = linstor.Client.Resources.CreateSnapshot(context.TODO(), linstorClient.Snapshot{
+		Name:         linstorSnapshotName,
+		ResourceName: resourceDefinition.Name,
+	})
+	if err != nil {
+		return fmt.Errorf("Could not create resource snapshot: %w", err)
+	}
+
+	_, snapshotName, _ := api.GetParentAndSnapshotName(snapVol.Name())
+	err = linstor.Client.ResourceDefinitions.Modify(context.TODO(), resourceDefinition.Name, linstorClient.GenericPropsModify{
+		OverrideProps: map[string]string{LinstorAuxSnapshotPrefix + snapshotName: linstorSnapshotName},
+	})
+	if err != nil {
+		_ = linstor.Client.Resources.DeleteSnapshot(context.TODO(), resourceDefinition.Name, linstorSnapshotName)
+		return err
+	}
+
+	return nil
+}
+
+// renameVolumeSnapshot renames a volume snapshot.
+func (d *linstor) renameVolumeSnapshot(parentVol Volume, snapVol Volume, newSnapshotName string) error {
+	l := d.logger.AddContext(logger.Ctx{"parentVol": parentVol.Name(), "snapVol": snapVol.Name()})
+	l.Debug("Renaming volume snapshot")
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return err
+	}
+
+	resourceDefinition, err := d.getResourceDefinition(parentVol, false)
+	if err != nil {
+		return err
+	}
+
+	// Get the snapshot name.
+	_, snapshotName, _ := api.GetParentAndSnapshotName(snapVol.Name())
+	linstorSnapshotName, ok := resourceDefinition.Props[LinstorAuxSnapshotPrefix+snapshotName]
+	if !ok {
+		return fmt.Errorf("Could not find snapshot name mapping for volume %s", parentVol.Name())
+	}
+
+	return linstor.Client.ResourceDefinitions.Modify(context.TODO(), resourceDefinition.Name, linstorClient.GenericPropsModify{
+		DeleteProps:   linstorClient.DeleteProps{LinstorAuxSnapshotPrefix + snapshotName},
+		OverrideProps: map[string]string{LinstorAuxSnapshotPrefix + newSnapshotName: linstorSnapshotName},
+	})
+}
+
+// deleteVolumeSnapshot deletes a volume snapshot.
+func (d *linstor) deleteVolumeSnapshot(parentVol Volume, snapVol Volume) error {
+	l := d.logger.AddContext(logger.Ctx{"parentVol": parentVol.Name(), "snapVol": snapVol.Name()})
+	l.Debug("Deleting volume snapshot")
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return err
+	}
+
+	resourceDefinition, err := d.getResourceDefinition(parentVol, false)
+	if err != nil {
+		return err
+	}
+
+	// Get the snapshot name.
+	_, snapshotName, _ := api.GetParentAndSnapshotName(snapVol.Name())
+	linstorSnapshotName, ok := resourceDefinition.Props[LinstorAuxSnapshotPrefix+snapshotName]
+	if !ok {
+		return fmt.Errorf("Could not find snapshot name mapping for volume %s", parentVol.Name())
+	}
+
+	err = linstor.Client.Resources.DeleteSnapshot(context.TODO(), resourceDefinition.Name, linstorSnapshotName)
+	if err != nil {
+		return fmt.Errorf("Could not delete resource snapshot: %w", err)
+	}
+
+	err = linstor.Client.ResourceDefinitions.Modify(context.TODO(), resourceDefinition.Name, linstorClient.GenericPropsModify{
+		DeleteProps: []string{LinstorAuxSnapshotPrefix + snapshotName},
+	})
+	if err != nil {
+		return fmt.Errorf("Could not delete snapshot name mapping aux property: %w", err)
+	}
+
+	return nil
+}
+
+// getSnapshotMap gets the map from LINSTOR snapshot names to Incus’.
+func (d *linstor) getSnapshotMap(parentVol Volume) (map[string]string, error) {
+	l := d.logger.AddContext(logger.Ctx{"parentVol": parentVol.Name()})
+	l.Debug("Getting snapshot map")
+	result := make(map[string]string)
+
+	resourceDefinition, err := d.getResourceDefinition(parentVol, false)
+	if err != nil {
+		return result, err
+	}
+
+	for key, value := range resourceDefinition.Props {
+		after, ok := strings.CutPrefix(key, LinstorAuxSnapshotPrefix)
+		if ok {
+			result[value] = after
+		}
+	}
+
+	return result, nil
+}
+
+// snapshotExists returns whether the given snapshot exists.
+func (d *linstor) snapshotExists(parentVol Volume, snapVol Volume) (bool, error) {
+	l := d.logger.AddContext(logger.Ctx{"parentVol": parentVol.Name(), "snapVol": snapVol.Name()})
+	l.Debug("Fetching Linstor snapshot")
+
+	// Retrieve the Linstor client.
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return false, err
+	}
+
+	resourceDefinition, err := d.getResourceDefinition(parentVol, false)
+	if err != nil {
+		if errors.Is(err, errResourceDefinitionNotFound) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	linstorSnapshotName, err := d.getLinstorSnapshotName(snapVol, resourceDefinition)
+	if err != nil {
+		if errors.Is(err, errSnapshotNotFound) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	_, err = linstor.Client.Resources.GetSnapshot(context.TODO(), resourceDefinition.Name, linstorSnapshotName)
+	if errors.Is(err, linstorClient.NotFoundError) {
+		l.Debug("Snapshot not found")
+		return false, nil
+	} else if err != nil {
+		return false, fmt.Errorf("Could not get snapshot: %w", err)
+	}
+
+	l.Debug("Got snapshot")
+
+	return true, nil
+}
+
+// getLinstorSnapshotName returns the Linstor snapshot name given a snapshot and its parent resource definition.
+func (d *linstor) getLinstorSnapshotName(snapVol Volume, resourceDefinition linstorClient.ResourceDefinitionWithVolumeDefinition) (string, error) {
+	_, snapshotName, _ := api.GetParentAndSnapshotName(snapVol.Name())
+	linstorSnapshotName, ok := resourceDefinition.Props[LinstorAuxSnapshotPrefix+snapshotName]
+	if !ok {
+		return "", errSnapshotNotFound
+	}
+
+	return linstorSnapshotName, nil
+}
+
+// restoreVolume restores a volume state from a snapshot.
+func (d *linstor) restoreVolume(vol Volume, snapVol Volume) error {
+	l := d.logger.AddContext(logger.Ctx{"vol": vol.Name(), "snapVol": snapVol.Name()})
+	l.Debug("Restoring volume to snapshot")
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return err
+	}
+
+	resourceDefinition, err := d.getResourceDefinition(vol, false)
+	if err != nil {
+		return err
+	}
+
+	linstorSnapshotName, err := d.getLinstorSnapshotName(snapVol, resourceDefinition)
+	if err != nil {
+		return err
+	}
+
+	err = linstor.Client.Resources.RollbackSnapshot(context.TODO(), resourceDefinition.Name, linstorSnapshotName)
+	if err != nil {
+		return fmt.Errorf("Could not restore volume to snapshot: %w", err)
+	}
+
+	return nil
+}
+
+// createResourceDefinitionFromSnapshot creates a new resource definition from a snapshot.
+func (d *linstor) createResourceDefinitionFromSnapshot(snapVol Volume, vol Volume) error {
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return err
+	}
+
+	rev := revert.New()
+	defer rev.Fail()
+
+	parentName, _, _ := api.GetParentAndSnapshotName(snapVol.name)
+	parentVol := NewVolume(d, d.name, snapVol.volType, snapVol.contentType, parentName, nil, nil)
+
+	parentResourceDefinition, err := d.getResourceDefinition(parentVol, false)
+	if err != nil {
+		return err
+	}
+
+	linstorSnapshotName, err := d.getLinstorSnapshotName(snapVol, parentResourceDefinition)
+	if err != nil {
+		return err
+	}
+
+	resourceDefinitionName := d.generateUUIDWithPrefix()
+
+	err = linstor.Client.ResourceDefinitions.Create(context.TODO(), linstorClient.ResourceDefinitionCreate{
+		ResourceDefinition: linstorClient.ResourceDefinition{
+			Name:              resourceDefinitionName,
+			ResourceGroupName: d.config[LinstorResourceGroupNameConfigKey],
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("Could not create resource definition from snapshot: %w", err)
+	}
+
+	rev.Add(func() { _ = linstor.Client.ResourceDefinitions.Delete(context.TODO(), resourceDefinitionName) })
+
+	err = d.setResourceDefinitionExactSize(resourceDefinitionName)
+	if err != nil {
+		return err
+	}
+
+	err = linstor.Client.Resources.RestoreVolumeDefinitionSnapshot(context.TODO(), parentResourceDefinition.Name, linstorSnapshotName, linstorClient.SnapshotRestore{
+		ToResource: resourceDefinitionName,
+	})
+	if err != nil {
+		return fmt.Errorf("Could not restore volume definition from snapshot: %w", err)
+	}
+
+	err = linstor.Client.Resources.RestoreSnapshot(context.TODO(), parentResourceDefinition.Name, linstorSnapshotName, linstorClient.SnapshotRestore{
+		ToResource: resourceDefinitionName,
+	})
+	if err != nil {
+		return fmt.Errorf("Could not restore resource from snapshot: %w", err)
+	}
+
+	// Set the aux properties on the new resource definition.
+	err = d.setResourceDefinitionProperties(vol, resourceDefinitionName)
+	if err != nil {
+		return err
+	}
+
+	rev.Success()
+	return nil
+}
+
+// deleteResourceDefinition deletes a resource definition, retrying on transient errors.
+func (d *linstor) deleteResourceDefinition(resourceDefinitionName string) error {
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return err
+	}
+
+	// DRBD demotes the resource asynchronously after the last close and the backing
+	// device can also be briefly held open (udev), so retry transient failures.
+	for range 20 {
+		err = linstor.Client.ResourceDefinitions.Delete(context.TODO(), resourceDefinitionName)
+		if err == nil {
+			break
+		}
+
+		if !linstorClient.IsApiCallError(err, linstorapi.FailInUse) && !linstorClient.IsApiCallError(err, linstorapi.FailUnknownError) {
+			break
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	return err
+}
+
+// deleteResourceDefinitionFromSnapshot deletes the resource definition created from a snapshot.
+func (d *linstor) deleteResourceDefinitionFromSnapshot(vol Volume) error {
+	l := d.logger.AddContext(logger.Ctx{"vol": vol.Name()})
+	l.Debug("Deleting resource definition for snapshot")
+
+	// Delete every matching resource definition, as an interrupted past deletion can leave more than one behind.
+	resourceDefinitions, err := d.getVolumeResourceDefinitions(vol, false)
+	if err != nil {
+		return err
+	}
+
+	for _, resourceDefinition := range resourceDefinitions {
+		err = d.deleteResourceDefinition(resourceDefinition.Name)
+		if err != nil {
+			return err
+		}
+	}
+
+	d.logger.Debug("Resource definition for snapshot deleted")
+
+	return nil
+}
+
+// resizeVolume resizes a volume definition. This function does not resize any filesystem inside the volume.
+func (d *linstor) resizeVolume(vol Volume, sizeBytes int64) error {
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return err
+	}
+
+	resourceDefinition, err := d.getResourceDefinition(vol, false)
+	if err != nil {
+		return err
+	}
+
+	volumeIndex := 0
+
+	// For VM volumes, the associated filesystem volume is a second volume on the same LINSTOR resource.
+	if vol.volType == VolumeTypeVM && vol.contentType == ContentTypeFS {
+		volumeIndex = 1
+	}
+
+	// LINSTOR cannot resize volume definitions with an exact size, so clear the
+	// property (it cannot be re-enabled while resources are deployed).
+	err = linstor.Client.ResourceDefinitions.Modify(context.TODO(), resourceDefinition.Name, linstorClient.GenericPropsModify{
+		DeleteProps: []string{"DrbdOptions/ExactSize"},
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to remove the exact size property: %w", err)
+	}
+
+	// LINSTOR refuses to resize while a replica is still syncing, which is the case right after a clone.
+	err = d.waitResourceDefinitionSynced(resourceDefinition.Name)
+	if err != nil {
+		return err
+	}
+
+	// Resize the volume definition.
+	err = linstor.Client.ResourceDefinitions.ModifyVolumeDefinition(context.TODO(), resourceDefinition.Name, volumeIndex, linstorClient.VolumeDefinitionModify{
+		SizeKib: uint64(sizeBytes) / 1024,
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to resize volume definition: %w", err)
+	}
+
+	return nil
+}
+
+// waitResourceDefinitionSynced waits for every replica of the resource definition to be in sync.
+func (d *linstor) waitResourceDefinitionSynced(resourceDefinitionName string) error {
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.TODO(), 5*time.Minute)
+	defer cancel()
+
+	for {
+		status, err := linstor.Client.ResourceDefinitions.SyncStatus(ctx, resourceDefinitionName)
+		if err != nil {
+			return fmt.Errorf("Unable to get sync status of resource definition %q: %w", resourceDefinitionName, err)
+		}
+
+		if status.SyncedOnAll {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("Timed out waiting for resource definition %q to sync", resourceDefinitionName)
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+func (d *linstor) copyVolume(vol Volume, srcVol Volume) error {
+	l := logger.AddContext(logger.Ctx{"vol": vol.name, "srcVol": srcVol.name})
+	l.Debug("Copying volume")
+
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return err
+	}
+
+	rev := revert.New()
+	defer rev.Fail()
+
+	targetResourceDefinitionName := d.generateUUIDWithPrefix()
+
+	srcResourceDefinition, err := d.getResourceDefinition(srcVol, false)
+	if err != nil {
+		return err
+	}
+
+	// Compute the target's properties so its identity can be set atomically at clone time. The
+	// clone inherits the source's properties, so without an immediate override the target would
+	// be indistinguishable from the source volume until the (potentially slow) clone completes.
+	overrideProps, err := d.resourceDefinitionProperties(vol)
+	if err != nil {
+		return err
+	}
+
+	cloneRequest := linstorClient.ResourceDefinitionCloneRequest{
+		Name:               targetResourceDefinitionName,
+		ResourceGroup:      d.config[LinstorResourceGroupNameConfigKey],
+		GenericPropsModify: linstorClient.GenericPropsModify{OverrideProps: overrideProps},
+	}
+
+	// Grow the volume as part of the clone when the controller supports it, as a later
+	// resize has to wait for the clone to finish syncing.
+	growBytes, err := d.cloneGrowSize(vol, srcVol)
+	if err != nil {
+		return err
+	}
+
+	if growBytes > 0 {
+		// The exact size property prevents resizing and is dropped by any resize anyway.
+		cloneRequest.VolumeSizes = []int64{growBytes / 1024}
+		cloneRequest.DeleteProps = []string{"DrbdOptions/ExactSize"}
+	}
+
+	// The controller may have created the target even when the request fails, so clean up on any error from here.
+	rev.Add(func() { _ = linstor.Client.ResourceDefinitions.Delete(context.TODO(), targetResourceDefinitionName) })
+
+	_, err = linstor.Client.ResourceDefinitions.Clone(context.TODO(), srcResourceDefinition.Name, cloneRequest)
+	if err != nil {
+		return fmt.Errorf("Unable to start cloning resource definition: %w", err)
+	}
+
+	d.logger.Debug("Clone operation started. Will poll for status", logger.Ctx{"srcResourceDefinition": srcResourceDefinition.Name, "targetResourceDefinition": targetResourceDefinitionName})
+
+	// Poll the cloning operation status from LINSTOR. The duration of the operation depends on the
+	// underlying storage backend being used. For LVM-thin and ZFS the cloning is optimized and should
+	// be considerably faster than for LVM, which uses `dd`.
+loop:
+	for {
+		cloneStatus, err := linstor.Client.ResourceDefinitions.CloneStatus(context.TODO(), srcResourceDefinition.Name, targetResourceDefinitionName)
+		if err != nil {
+			return fmt.Errorf("Unable to get clone operation status: %w", err)
+		}
+
+		d.logger.Debug("Got resource definition clone status", logger.Ctx{"cloneStatus": cloneStatus.Status})
+
+		switch cloneStatus.Status {
+		case clonestatus.Complete:
+			break loop
+		case clonestatus.Cloning:
+			time.Sleep(1 * time.Second)
+		case clonestatus.Failed:
+			return errors.New("Clone operation failed")
+		}
+	}
+
+	// Re-apply the aux properties in case the controller ignored the ones in the clone request.
+	err = d.setResourceDefinitionProperties(vol, targetResourceDefinitionName)
+	if err != nil {
+		return err
+	}
+
+	// The clone inherits every member of the source, drop the diskless ones as the new
+	// volume gets its own when mounted and stale image attachments shouldn't spread.
+	resources, err := linstor.Client.Resources.GetAll(context.TODO(), targetResourceDefinitionName)
+	if err != nil {
+		return fmt.Errorf("Unable to get the resources for the resource definition: %w", err)
+	}
+
+	for _, r := range resources {
+		if !slices.Contains(r.Flags, linstorapi.FlagDiskless) || slices.Contains(r.Flags, linstorapi.FlagTieBreaker) {
+			continue
+		}
+
+		err = linstor.Client.Resources.Delete(context.TODO(), r.Name, r.NodeName)
+		if err != nil {
+			return fmt.Errorf("Unable to delete diskless resource on node %q: %w", r.NodeName, err)
+		}
+	}
+
+	// A grown VM disk needs its GPT alt header moved to the new end of the disk.
+	if growBytes > 0 && vol.IsVMBlock() {
+		devPath, err := d.getLinstorDevPath(vol)
+		if err != nil {
+			return err
+		}
+
+		err = d.moveGPTAltHeader(devPath)
+		if err != nil {
+			return err
+		}
+	}
+
+	rev.Success()
+
+	return nil
+}
+
+// cloneGrowSize returns the size in bytes to grow a clone of srcVol to during the clone, or 0 to keep the source size.
+func (d *linstor) cloneGrowSize(vol Volume, srcVol Volume) (int64, error) {
+	if vol.config["size"] == "" || vol.config["size"] == "0" {
+		return 0, nil
+	}
+
+	sizeBytes, err := units.ParseByteSizeString(vol.config["size"])
+	if err != nil {
+		return 0, err
+	}
+
+	if sizeBytes <= 0 {
+		return 0, nil
+	}
+
+	sizeBytes, err = d.roundVolumeBlockSizeBytes(vol, sizeBytes)
+	if err != nil {
+		return 0, err
+	}
+
+	srcSizeBytes, err := d.getVolumeSize(srcVol)
+	if err != nil {
+		return 0, err
+	}
+
+	// Shrinking is left to the regular resize so it reports the usual error.
+	if sizeBytes <= srcSizeBytes {
+		return 0, nil
+	}
+
+	// Resizing during the clone needs LINSTOR 1.35.0.
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return 0, err
+	}
+
+	controller, err := linstor.Client.Controller.GetVersion(context.TODO())
+	if err != nil {
+		return 0, fmt.Errorf("Unable to get the controller version: %w", err)
+	}
+
+	ver, err := version.Parse(controller.Version)
+	if err != nil {
+		return 0, nil
+	}
+
+	if ver.Major < 1 || (ver.Major == 1 && ver.Minor < 35) {
+		return 0, nil
+	}
+
+	return sizeBytes, nil
+}
+
+func (d *linstor) getVolumeSize(vol Volume) (int64, error) {
+	resourceDefinition, err := d.getResourceDefinition(vol, true)
+	if err != nil {
+		return 0, err
+	}
+
+	volumeIndex := 0
+	if len(resourceDefinition.VolumeDefinitions) == 2 {
+		// For VM volumes, the associated filesystem volume is a second volume on the same LINSTOR resource.
+		if (vol.volType == VolumeTypeVM || vol.volType == VolumeTypeImage) && vol.contentType == ContentTypeFS {
+			volumeIndex = 1
+		}
+	}
+
+	return int64(resourceDefinition.VolumeDefinitions[volumeIndex].SizeKib * 1024), nil
+}
+
+// getResourceDefinitions returns all available resource definitions.
+func (d *linstor) getResourceDefinitions() ([]linstorClient.ResourceDefinitionWithVolumeDefinition, error) {
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return nil, err
+	}
+
+	// Get the resource definitions.
+	resourceDefinitions, err := linstor.Client.ResourceDefinitions.GetAll(context.TODO(), linstorClient.RDGetAllRequest{
+		WithVolumeDefinitions: false,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("Unable to get resource definitions: %w", err)
+	}
+
+	return resourceDefinitions, nil
+}
+
+// setResourceDefinitionExactSize enables the DRBD exact size on a resource definition.
+// This can only be done before any resource is deployed and is inherited when cloning.
+func (d *linstor) setResourceDefinitionExactSize(resourceDefinitionName string) error {
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return err
+	}
+
+	// Expose exactly the requested size rather than what the backing storage rounded up to.
+	err = linstor.Client.ResourceDefinitions.Modify(context.TODO(), resourceDefinitionName, linstorClient.GenericPropsModify{
+		OverrideProps: map[string]string{"DrbdOptions/ExactSize": "true"},
+	})
+	if err != nil {
+		return fmt.Errorf("Could not set exact size on resource definition: %w", err)
+	}
+
+	return nil
+}
+
+// resourceDefinitionProperties computes the properties to set on a volume's resource definition.
+func (d *linstor) resourceDefinitionProperties(vol Volume) (map[string]string, error) {
+	// Set the base properties.
+	props := map[string]string{
+		LinstorAuxName:                        d.config[LinstorVolumePrefixConfigKey] + vol.name,
+		LinstorAuxType:                        string(vol.volType),
+		LinstorAuxContentType:                 string(vol.contentType),
+		"DrbdOptions/Net/allow-two-primaries": "yes", // Required for mounting volumes simultaneously on two nodes when live migrating
+	}
+
+	// Parse and set properties derived from config.
+	drbdProps, err := d.drbdPropsFromConfig(vol.config)
+	if err != nil {
+		return nil, fmt.Errorf("Could parse config into DRBD options: %w", err)
+	}
+
+	maps.Copy(props, drbdProps)
+
+	return props, nil
+}
+
+// setResourceDefinitionProperties sets properties on the resource definition based on the volume config.
+func (d *linstor) setResourceDefinitionProperties(vol Volume, resourceDefinitionName string) error {
+	l := logger.AddContext(logger.Ctx{"volume": vol.Name(), "resourceDefinition": resourceDefinitionName})
+	l.Debug("Setting resource definition properties", logger.Ctx{"config": vol.config})
+
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return err
+	}
+
+	overrideProps, err := d.resourceDefinitionProperties(vol)
+	if err != nil {
+		return err
+	}
+
+	err = linstor.Client.ResourceDefinitions.Modify(context.TODO(), resourceDefinitionName, linstorClient.GenericPropsModify{
+		OverrideProps: overrideProps,
+	})
+	if err != nil {
+		return fmt.Errorf("Could not set properties on resource definition: %w", err)
+	}
+
+	return nil
+}
+
+// updateResourceDefinitionupdates the resource definition with the given changed configs.
+func (d *linstor) updateResourceDefinition(vol Volume, changedConfig map[string]string) error {
+	l := logger.AddContext(logger.Ctx{"volume": vol.Name()})
+	l.Debug("Updating resource definition", logger.Ctx{"changedchangedConfig": changedConfig})
+
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return err
+	}
+
+	resourceDefinition, err := d.getResourceDefinition(vol, false)
+	if err != nil {
+		return err
+	}
+
+	// Parse and set properties to be overwritten.
+	changedProps, err := d.drbdPropsFromConfig(changedConfig)
+	if err != nil {
+		return fmt.Errorf("Could not parse configuration into DRBD properties: %w", err)
+	}
+
+	overrideProps := make(map[string]string)
+	deleteProps := []string{}
+
+	// Discriminate properties changed and properties deleted.
+	for key, value := range changedProps {
+		if value == "" {
+			deleteProps = append(deleteProps, key)
+		} else {
+			overrideProps[key] = value
+		}
+	}
+
+	err = linstor.Client.ResourceDefinitions.Modify(context.TODO(), resourceDefinition.Name, linstorClient.GenericPropsModify{
+		OverrideProps: overrideProps,
+		DeleteProps:   deleteProps,
+	})
+	if err != nil {
+		return fmt.Errorf("Could not set properties on resource definition: %w", err)
+	}
+
+	return nil
+}
+
+// drbdPropsFromConfig creates a map of DRBD properties from the given volume or storage pool config.
+func (d *linstor) drbdPropsFromConfig(config map[string]string) (map[string]string, error) {
+	props := map[string]string{}
+
+	for key, value := range config {
+		prop, err := drbdPropsMap(key)
+		if err != nil {
+			if errors.Is(err, errNotDRBDKey) {
+				continue
+			} else {
+				return nil, err
+			}
+		}
+
+		switch key {
+		case DrbdAutoDiskfulConfigKey:
+			duration, err := time.ParseDuration(value)
+			if err != nil {
+				return nil, err
+			}
+
+			props[prop] = strconv.Itoa(int(duration.Seconds()))
+		case DrbdAutoAddQuorumTiebreakerConfigKey:
+			if util.IsFalse(value) {
+				props[prop] = "false"
+			} else {
+				props[prop] = "true"
+			}
+
+		default:
+			props[prop] = value
+		}
+	}
+
+	return props, nil
+}
+
+// getSnapshots retrieves all snapshots for a given resource definition name.
+func (d *linstor) getSnapshots(resourceDefinitionName string) ([]linstorClient.Snapshot, error) {
+	linstor, err := d.state.Linstor()
+	if err != nil {
+		return []linstorClient.Snapshot{}, err
+	}
+
+	snapshots, err := linstor.Client.Resources.GetSnapshots(context.TODO(), resourceDefinitionName)
+	if err != nil {
+		return snapshots, fmt.Errorf("Unable to get snapshots: %w", err)
+	}
+
+	return snapshots, nil
+}
+
+// rsyncMigrationType returns the migration types to use for a given content type.
+func (d *linstor) rsyncMigrationType(contentType ContentType) localMigration.Type {
+	var rsyncTransportType migration.MigrationFSType
+
+	if IsContentBlock(contentType) {
+		rsyncTransportType = migration.MigrationFSType_BLOCK_AND_RSYNC
+	} else {
+		rsyncTransportType = migration.MigrationFSType_RSYNC
+	}
+
+	return localMigration.Type{
+		FSType:   rsyncTransportType,
+		Features: genericVFSMigrationFeatures(d.Config(), rsyncTransportType),
+	}
+}
+
+// parseVolumeType parses a string into a volume type.
+func (d *linstor) parseVolumeType(s string) (*VolumeType, bool) {
+	for _, volType := range d.Info().VolumeTypes {
+		if s == string(volType) {
+			return &volType, true
+		}
+	}
+
+	return nil, false
+}
+
+// parseContentType parses a string into a volume type.
+func (d *linstor) parseContentType(s string) (*ContentType, bool) {
+	for _, contentType := range []ContentType{ContentTypeFS, ContentTypeBlock, ContentTypeISO} {
+		if s == string(contentType) {
+			return &contentType, true
+		}
+	}
+
+	return nil, false
+}
+
+// generateUUIDWithPrefix generates a new UUID (without "-") and appends it to the configured volume prefix.
+func (d *linstor) generateUUIDWithPrefix() string {
+	return d.config[LinstorVolumePrefixConfigKey] + strings.ReplaceAll(uuid.NewString(), "-", "")
+}
